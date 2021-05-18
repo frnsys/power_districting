@@ -1,42 +1,12 @@
-import maup
-import fiona
-import geopandas
-import pandas as pd
-from tqdm import tqdm
+import data
 from gerrychain import Graph
 from networkx import is_connected, connected_components
 import matplotlib.pyplot as plt
 
-# Census tracts
-units_file = 'data/src/ACS_2018_5YR_TRACT_36_NEW_YORK.gdb'
-districts_file = 'data/src/ny_legislative_boundaries/NYS-Assembly-Districts.shp'
-keep_layers = ['X01_AGE_AND_SEX']
-
-# Load tract data
-# See `data/src/ACS_2018_5YR_TRACT_36_NEW_YORK.gdb/TRACT_METADATA_2018.txt`
-gdb_layers = fiona.listlayers(units_file)
-geo_layer = 'ACS_2018_5YR_TRACT_36_NEW_YORK'
-gdb_layers = [l for l in gdb_layers if l.startswith('X')]
-print('Layers:', gdb_layers)
-print('Using layers:', keep_layers)
-
-units = geopandas.read_file(units_file, layer=geo_layer)
+units = data.load_tracts()
+print('Layers:', data.available_tract_layers())
+print('Using layers:', data.keep_layers)
 print('Tracts:', len(units))
-for layer in tqdm(keep_layers, desc='Merging geodatabase tract layers'):
-    other = geopandas.read_file(units_file, layer=layer)
-    other['GEOID'] = other['GEOID'].str[7:]
-    units = units.merge(other.drop('geometry', axis=1), on='GEOID')
-ej_df = pd.read_csv('data/src/FPTZ_NY_3/Map_data.csv', dtype={'Tract_ID': str})
-units = units.merge(ej_df, left_on='GEOID', right_on='Tract_ID')
-print('Tracts after merging EJ data:', len(units))
-
-# Assign tracts to districts
-print('Assigning census tracts to districts...')
-districts = geopandas.read_file(districts_file)
-units.to_crs(districts.crs, inplace=True)
-assignment = maup.assign(units, districts)
-assert assignment.isna().sum() == 0 # Assert all units were successfully assigned
-units["DISTRICT"] = assignment
 
 # Load/build the node graph (node=unit)
 print('Generating graph from census tracts...')
