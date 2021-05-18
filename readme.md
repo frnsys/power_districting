@@ -1,11 +1,3 @@
-## Notes
-
-TODO document:
-
-- EJ data source
-- Add additional constraints: crossover districts, EJ data
-- Incorporate energy infrastructure as a constraint?
-
 ## Usage
 
 1. Run `gen_graph.py` to generate the district graph data.
