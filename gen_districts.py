@@ -1,14 +1,14 @@
+import os
 import data
 import maup
 import json
-from maup.indexed_geometries import IndexedGeometries
+from glob import glob
 from tqdm import tqdm
-from functools import partial
 from collections import defaultdict
-from gerrychain.proposals import recom, propose_random_flip
-from gerrychain.accept import always_accept
 from gerrychain.updaters import Tally, cut_edges
-from gerrychain import Graph, Partition, MarkovChain, constraints, tree
+from gerrychain import Graph, Partition, constraints, tree
+from maup.indexed_geometries import IndexedGeometries
+from search import hill_climbing
 import matplotlib.pyplot as plt
 
 # Ignore maup warnings
@@ -184,36 +184,8 @@ initial_partition = Partition(
     }
 )
 
-import os
-from glob import glob
-for f in glob('data/gen/maps/*.png'):
-    os.remove(f)
 
-# Plot initial districts
-initial_partition.plot(units, figsize=(10, 10), cmap='RdYlBu_r')
-plt.axis('off')
-# plt.show()
-plt.savefig('data/gen/maps/_init.png')
-plt.close()
-
-
-# District proposal method: ReCom
-# For more on ReCom see <https://mggg.org/VA-report.pdf>
-#   At each step, we (uniformly) randomly select a pair of adjacent districts and
-#   merge all of their blocks in to a single unit. Then, we generate a spanning tree
-#   for the blocks of the merged unit with the Kruskal/Karger algorithm. Finally,
-#   we cut an edge of the tree at random, checking that this separates the region
-#   into two new districts that are population balanced.
-# pop_percent_margin:
-#   This should be something like 0.01 but the initial districting fails to meet this criteria
-#   unless it's a higher value like 0.25
-pop_percent_margin = TARGET_POP_MARGIN if INIT_DISTRICT == 'generate' else 0.25
 ideal_population = sum(initial_partition['population'].values()) / len(initial_partition)
-proposal = partial(recom,
-                   pop_col='population',
-                   pop_target=ideal_population,
-                   epsilon=pop_percent_margin,
-                   node_repeats=2)
 
 # Compactness: bound the number of cut edges at 2 times the number of cut edges in the initial plan
 compactness_bound = constraints.UpperBound(
@@ -222,9 +194,8 @@ compactness_bound = constraints.UpperBound(
 )
 
 # Population
-pop_constraint = constraints.within_percent_of_ideal_population(initial_partition, pop_percent_margin)
+pop_constraint = constraints.within_percent_of_ideal_population(initial_partition, TARGET_POP_MARGIN)
 
-from search import hill_climbing
 def succ_func(partition):
     # Based on `propose_random_flip`
     if len(partition['cut_edges']) == 0:
@@ -236,7 +207,7 @@ def succ_func(partition):
             flipped_node, other_node = edge[index], edge[1 - index]
             flip = {flipped_node: partition.assignment[other_node]}
             p = partition.flip(flip)
-            succs.append((p, score_func(p))) # score_func is very slow
+            succs.append((p, score_func(p))) # TODO score_func is very slow
     succs.sort(key=lambda x: x[1], reverse=True)
     return [v for (v, _) in succs]
 
@@ -251,8 +222,8 @@ def score_func(partition):
 def hash_func(partition):
     return hash(frozenset(partition.assignment.items()))
 
+
 print('Searching for a districting plan that satisfies criteria...')
-# res = ida(initial_partition, succ_func, goal_func, hash_func=hash_func)
 best_partition = hill_climbing(
         initial_partition,
         succ_func,
@@ -260,55 +231,22 @@ best_partition = hill_climbing(
         max_depth=1000,
         hash_func=hash_func)
 
-# chain = MarkovChain(
-#     # proposal=proposal,
-#     proposal=propose_random_flip,
 
-#     # Constraints: a list of predicates that return
-#     # whether or not a map is valid
-#     # Built-in constraints: <https://gerrychain.readthedocs.io/en/latest/api.html#module-gerrychain.constraints>
-#     constraints=[
-#         # compactness_bound,
-#         # pop_constraint,
-#         # constraints.contiguous # Initial districts aren't contiguous, so this fails if using real districts
-#     ],
-
-#     # Whether or not to accept a valid proposed map.
-#     # `always_accept` always accepts valid proposals
-#     accept=always_accept,
-
-#     # Initial state
-#     initial_state=initial_partition,
-
-#     # Number of valid maps to step through
-#     total_steps=1000
-# )
-
-
-desiderata = {
-    'All are crossover districts': lambda p: all(partition['ej_class_crossover_district'].values())
-}
-
-# Iterate over the proposals
+# Plot maps
 print('Generating maps...')
-import imageio
+for f in glob('data/gen/maps/*.png'):
+    os.remove(f)
 
-images = []
-# for i, partition in enumerate(chain.with_progress_bar()):
+initial_partition.plot(units, figsize=(10, 10), cmap='RdYlBu_r')
+plt.axis('off')
+plt.savefig('data/gen/maps/_init.png')
+plt.close()
+
 for i, partition in enumerate([best_partition]):
     print('% crossover districts:', sum(1 for d in partition['ej_class_crossover_district'].values() if d)/n_districts)
     print('% majority-minority:', sum(1 for d in partition['ej_class_majority_minority'].values() if d)/n_districts)
-    # for label, d in desiderata.items():
-    #     print(label, ':', d(partition))
-    #     if d(partition):
-    #         import ipdb; ipdb.set_trace()
     partition.plot(units, figsize=(10, 10), cmap='RdYlBu_r')
     plt.axis('off')
     path = 'data/gen/maps/{}.png'.format(i)
     plt.savefig(path)
     plt.close()
-    images.append(imageio.imread(path))
-imageio.mimsave('data/gen/maps.gif', images)
-    # print(sorted(partition["SEN12"].percents("Dem")))
-
-import ipdb; ipdb.set_trace()
