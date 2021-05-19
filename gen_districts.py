@@ -5,7 +5,7 @@ from maup.indexed_geometries import IndexedGeometries
 from tqdm import tqdm
 from functools import partial
 from collections import defaultdict
-from gerrychain.proposals import recom
+from gerrychain.proposals import recom, propose_random_flip
 from gerrychain.accept import always_accept
 from gerrychain.updaters import Tally, cut_edges
 from gerrychain import Graph, Partition, MarkovChain, constraints, tree
@@ -30,6 +30,7 @@ graph = Graph.from_json('data/gen/graph.json')
 # Generate initial districts
 # (if not using real districts)
 if INIT_DISTRICT == 'generate':
+    print('Generating districts...')
     total_pop = sum(graph.nodes[n]['population'] for n in graph.nodes)
     ideal_pop = total_pop/N_DISTRICTS
     init = tree.recursive_tree_part(
@@ -46,7 +47,7 @@ if INIT_DISTRICT == 'generate':
 
 elif INIT_DISTRICT == 'assembly_districts':
     # Assign tracts to districts
-    print('Assigning census tracts to districts...')
+    print('Assigning census tracts to assembly districts...')
     districts = data.load_districts()
     units.to_crs(districts.crs, inplace=True)
     assignment = maup.assign(units, districts)
@@ -101,9 +102,11 @@ def _pop_weighted_mean(partition, key):
         data[part] = sum(vals)/total_pop
     return data
 
+# Calculate population-weighted mean EJ class
 def mean_ej_class(partition):
     return _pop_weighted_mean(partition, 'EJ_Class')
 
+# Count population for each EJ class
 def ej_classes(partition):
     data = {}
     for part in partition.parts:
@@ -114,6 +117,7 @@ def ej_classes(partition):
         data[part] = counts
     return data
 
+# Count percent of "minority" EJ class population
 def ej_class_minority_percent(partition):
     data = {}
     for part, counts in partition['ej_classes'].items():
@@ -180,11 +184,16 @@ initial_partition = Partition(
     }
 )
 
+import os
+from glob import glob
+for f in glob('data/gen/maps/*.png'):
+    os.remove(f)
+
 # Plot initial districts
 initial_partition.plot(units, figsize=(10, 10), cmap='RdYlBu_r')
 plt.axis('off')
 # plt.show()
-plt.savefig('data/gen/init_map.png')
+plt.savefig('data/gen/maps/_init.png')
 plt.close()
 
 
@@ -215,28 +224,65 @@ compactness_bound = constraints.UpperBound(
 # Population
 pop_constraint = constraints.within_percent_of_ideal_population(initial_partition, pop_percent_margin)
 
-chain = MarkovChain(
-    proposal=proposal,
+from search import hill_climbing
+def succ_func(partition):
+    # Based on `propose_random_flip`
+    if len(partition['cut_edges']) == 0:
+        return []
 
-    # Constraints: a list of predicates that return
-    # whether or not a map is valid
-    # Built-in constraints: <https://gerrychain.readthedocs.io/en/latest/api.html#module-gerrychain.constraints>
-    constraints=[
-        # compactness_bound,
-        # pop_constraint,
-        # constraints.contiguous # Initial districts aren't contiguous, so this fails if using real districts
-    ],
+    succs = []
+    for edge in partition['cut_edges']:
+        for index in [0, 1]:
+            flipped_node, other_node = edge[index], edge[1 - index]
+            flip = {flipped_node: partition.assignment[other_node]}
+            p = partition.flip(flip)
+            succs.append((p, score_func(p))) # score_func is very slow
+    succs.sort(key=lambda x: x[1], reverse=True)
+    return [v for (v, _) in succs]
 
-    # Whether or not to accept a valid proposed map.
-    # `always_accept` always accepts valid proposals
-    accept=always_accept,
+def goal_func(partition):
+    p_crossover_districts = sum(1 for d in partition['ej_class_crossover_district'].values() if d)/n_districts
+    return p_crossover_districts > 0.9
 
-    # Initial state
-    initial_state=initial_partition,
+def score_func(partition):
+    p_crossover_districts = sum(1 for d in partition['ej_class_crossover_district'].values() if d)/n_districts
+    return p_crossover_districts
 
-    # Number of valid maps to step through
-    total_steps=100
-)
+def hash_func(partition):
+    return hash(frozenset(partition.assignment.items()))
+
+print('Searching for a districting plan that satisfies criteria...')
+# res = ida(initial_partition, succ_func, goal_func, hash_func=hash_func)
+best_partition = hill_climbing(
+        initial_partition,
+        succ_func,
+        goal_func,
+        max_depth=1000,
+        hash_func=hash_func)
+
+# chain = MarkovChain(
+#     # proposal=proposal,
+#     proposal=propose_random_flip,
+
+#     # Constraints: a list of predicates that return
+#     # whether or not a map is valid
+#     # Built-in constraints: <https://gerrychain.readthedocs.io/en/latest/api.html#module-gerrychain.constraints>
+#     constraints=[
+#         # compactness_bound,
+#         # pop_constraint,
+#         # constraints.contiguous # Initial districts aren't contiguous, so this fails if using real districts
+#     ],
+
+#     # Whether or not to accept a valid proposed map.
+#     # `always_accept` always accepts valid proposals
+#     accept=always_accept,
+
+#     # Initial state
+#     initial_state=initial_partition,
+
+#     # Number of valid maps to step through
+#     total_steps=1000
+# )
 
 
 desiderata = {
@@ -245,16 +291,17 @@ desiderata = {
 
 # Iterate over the proposals
 print('Generating maps...')
-import os
 import imageio
-from glob import glob
-for f in glob('data/gen/maps/*.png'):
-    os.remove(f)
 
 images = []
-for i, partition in enumerate(chain.with_progress_bar()):
-    for label, d in desiderata.items():
-        print(label, ':', d(partition))
+# for i, partition in enumerate(chain.with_progress_bar()):
+for i, partition in enumerate([best_partition]):
+    print('% crossover districts:', sum(1 for d in partition['ej_class_crossover_district'].values() if d)/n_districts)
+    print('% majority-minority:', sum(1 for d in partition['ej_class_majority_minority'].values() if d)/n_districts)
+    # for label, d in desiderata.items():
+    #     print(label, ':', d(partition))
+    #     if d(partition):
+    #         import ipdb; ipdb.set_trace()
     partition.plot(units, figsize=(10, 10), cmap='RdYlBu_r')
     plt.axis('off')
     path = 'data/gen/maps/{}.png'.format(i)
