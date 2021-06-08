@@ -1,25 +1,19 @@
-import os
 import data
-import maup
-import json
-from glob import glob
-from tqdm import tqdm
+import cProfile
+import numpy as np
+import init_districts
+from plot import plot_partition
 from collections import defaultdict
 from gerrychain.updaters import Tally, cut_edges
-from gerrychain import Graph, Partition, constraints, tree
-from maup.indexed_geometries import IndexedGeometries
+from gerrychain import Graph, Partition, constraints
 from search import hill_climbing
-import matplotlib.pyplot as plt
 
-# Ignore maup warnings
-import warnings; warnings.filterwarnings('ignore', 'GeoSeries.isna', UserWarning)
-
-# INIT_DISTRICT = 'generate'
-INIT_DISTRICT = 'service_territories'
-# INIT_DISTRICT = 'assembly_districts'
-N_DISTRICTS = 20
-TARGET_POP_MARGIN = 0.02
+# EJ scores >= are considered "minority"
+# for the purpose of scoring a districting plan
 EJ_CUTOFF = 3
+MIN_CANDIDATE = 'Teachout'
+MAJ_CANDIDATE = 'Cuomo'
+CROSSOVER_MIN_MINORITY_PERCENT = 0.25
 
 # Geometry for plotting
 units = data.load_tracts(geom_only=True)
@@ -27,70 +21,13 @@ units = data.load_tracts(geom_only=True)
 # Load generated graph
 graph = Graph.from_json('data/gen/graph.json')
 
-# Generate initial districts
-# (if not using real districts)
-if INIT_DISTRICT == 'generate':
-    print('Generating districts...')
-    total_pop = sum(graph.nodes[n]['population'] for n in graph.nodes)
-    ideal_pop = total_pop/N_DISTRICTS
-    init = tree.recursive_tree_part(
-            graph,
-            parts=range(N_DISTRICTS),
-            pop_target=ideal_pop,
-            pop_col='population',
-            epsilon=TARGET_POP_MARGIN,
-            node_repeats=2)
-    for n in graph.nodes:
-        node = graph.nodes[n]
-        node['DISTRICT'] = init[n]
-    n_districts = len(set(init.values()))
-
-elif INIT_DISTRICT == 'assembly_districts':
-    # Assign tracts to districts
-    print('Assigning census tracts to assembly districts...')
-    districts = data.load_districts()
-    units.to_crs(districts.crs, inplace=True)
-    assignment = maup.assign(units, districts)
-    assert assignment.isna().sum() == 0 # Assert all units were successfully assigned
-    for n in graph.nodes:
-        graph.nodes[n]['DISTRICT'] = assignment[n]
-    n_districts = len(set(assignment.values))
-
-elif INIT_DISTRICT == 'service_territories':
-    # Problem with this one is it's not contiguous and
-    # there are many overlapping service territories
-    print('Assigning census tracts to service territories...')
-    try:
-        assignment = json.load(open('data/gen/initial/service_territories.json'))
-        assignment = {int(k): v for k, v in assignment.items()}
-    except FileNotFoundError:
-        service_territories = data.load_service_territories()
-        units.to_crs(service_territories.crs, inplace=True)
-        geoms = IndexedGeometries(service_territories)
-        assignment = {}
-        for i, unit in tqdm(units.iterrows(), total=len(units)):
-            candidates = []
-            for j, intersection in geoms.intersections(unit.geometry).items():
-                terr = service_territories.loc[j]
-                candidates.append((j, intersection.area, terr.geometry.area))
-
-            if len(candidates) == 1:
-                assignment[i] = candidates[0][0]
-            elif len(candidates) > 1:
-                # If multiple candidates, pick the one with the most overlap and smallest service territory
-                assignment[i] = sorted(candidates, key=lambda c: (-c[1], c[2]))[0][0]
-            else:
-                # If no candidates, pick the closest, smallest service territory
-                for j, terr in geoms.query(unit.geometry).items():
-                    candidates.append((j, unit.geometry.distance(terr), terr.area))
-                assignment[i] = sorted(candidates, key=lambda c: (c[1], c[2]))[0][0]
-        with open('data/gen/initial/service_territories.json', 'w') as f:
-            json.dump(assignment, f)
-
-    for n in graph.nodes:
-        graph.nodes[n]['DISTRICT'] = assignment[n]
-    n_districts = len(set(assignment.values()))
-
+# Create initial district assignment
+# assignment = init_districts.service_territories(units)
+assignment = init_districts.state_assembly(units)
+for n in graph.nodes:
+    graph.nodes[n]['DISTRICT'] = assignment[n]
+n_districts = len(set(assignment))
+print('Districts:', n_districts)
 
 # Updaters
 def _pop_weighted_mean(partition, key):
@@ -102,9 +39,23 @@ def _pop_weighted_mean(partition, key):
         data[part] = sum(vals)/total_pop
     return data
 
+def _mean(partition, key):
+    data = {}
+    for part in partition.parts:
+        nodes = [partition.graph.nodes[n] for n in partition.parts[part]]
+        vals = [n[key] for n in nodes]
+        data[part] = sum(vals)/len(vals)
+    return data
+
 # Calculate population-weighted mean EJ class
 def mean_ej_class(partition):
     return _pop_weighted_mean(partition, 'EJ_Class')
+
+def mean_wind_class(partition):
+    return _mean(partition, 'Wind_Class')
+
+def mean_solar_class(partition):
+    return _mean(partition, 'Solar_Class')
 
 # Count population for each EJ class
 def ej_classes(partition):
@@ -124,24 +75,34 @@ def ej_class_minority_percent(partition):
         data[part] = sum(count for ej_class, count in counts.items() if ej_class >= EJ_CUTOFF)/sum(counts.values())
     return data
 
-# A crossover district is one in which,
-# when voting with the majority,
-# the minority population can vote in their candidate of choice,
-# even if they have <50% of the population.
 def ej_class_crossover_district(partition):
-    data = {}
+    is_crossover = {}
+    # min_percent = partition['ej_class_minority_percent']
     for part in partition.parts:
-        dem_win = partition['votes_dem'][part] > partition['votes_gop'][part]
-        minority_pref = {'dem': 0, 'gop': 0}
+        # if min_percent[part] < CROSSOVER_MIN_MINORITY_PERCENT:
+        #     is_crossover[part] = False
+        #     continue
         nodes = [partition.graph.nodes[n] for n in partition.parts[part]]
-        for n in nodes:
-            if n['EJ_Class'] >= EJ_CUTOFF:
-                minority_pref['dem'] += n['votes_dem']
-                minority_pref['gop'] += n['votes_gop']
+        min_cand_total, maj_cand_total = district_votes(nodes)
+        is_crossover[part] = min_cand_total > maj_cand_total
+    return is_crossover
 
-        dem_win_minority = minority_pref['dem'] > minority_pref['gop']
-        data[part] = dem_win == dem_win_minority
-    return data
+
+def district_votes(nodes):
+    minority_votes = {'min_cand': 0, 'maj_cand': 0}
+    majority_votes = {'min_cand': 0, 'maj_cand': 0}
+    for n in nodes:
+        if n['EJ_Class'] >= EJ_CUTOFF:
+            minority_votes['min_cand'] += n[MIN_CANDIDATE]
+            minority_votes['maj_cand'] += n[MAJ_CANDIDATE]
+        else:
+            majority_votes['min_cand'] += n[MIN_CANDIDATE]
+            majority_votes['maj_cand'] += n[MAJ_CANDIDATE]
+
+    min_cand_total = minority_votes['min_cand'] + majority_votes['min_cand']
+    maj_cand_total = minority_votes['maj_cand'] + majority_votes['maj_cand']
+    return min_cand_total, maj_cand_total
+
 
 # A majority-minority district is one where
 # the minority makes up >50% of the population
@@ -171,8 +132,8 @@ initial_partition = Partition(
         # Calculate district populations
         'population': Tally('population', alias='population'),
 
-        'votes_dem': Tally('votes_dem', alias='votes_dem'),
-        'votes_gop': Tally('votes_gop', alias='votes_gop'),
+        'votes_min': Tally(MIN_CANDIDATE, alias='votes_min'),
+        'votes_maj': Tally(MAJ_CANDIDATE, alias='votes_maj'),
 
         'mean_ej_class': mean_ej_class,
         'ej_classes': ej_classes,
@@ -180,12 +141,11 @@ initial_partition = Partition(
         'ej_class_majority_minority': ej_class_majority_minority,
         'ej_class_crossover_district': ej_class_crossover_district,
 
+        'mean_wind_class': mean_wind_class,
+        'mean_solar_class': mean_solar_class,
         'power_plants': count_power_plants,
     }
 )
-
-
-ideal_population = sum(initial_partition['population'].values()) / len(initial_partition)
 
 # Compactness: bound the number of cut edges at 2 times the number of cut edges in the initial plan
 compactness_bound = constraints.UpperBound(
@@ -193,60 +153,108 @@ compactness_bound = constraints.UpperBound(
     2*len(initial_partition['cut_edges'])
 )
 
-# Population
-pop_constraint = constraints.within_percent_of_ideal_population(initial_partition, TARGET_POP_MARGIN)
-
 def succ_func(partition):
     # Based on `propose_random_flip`
     if len(partition['cut_edges']) == 0:
         return []
 
     succs = []
+    all_district_votes = {part_id: district_votes([partition.graph.nodes[n] for n in node_ids]) for part_id, node_ids in partition.parts.items()}
     for edge in partition['cut_edges']:
         for index in [0, 1]:
-            flipped_node, other_node = edge[index], edge[1 - index]
-            flip = {flipped_node: partition.assignment[other_node]}
+            flipped_node_idx, other_node_idx = edge[index], edge[1 - index]
+            flipped_node = partition.graph.nodes[flipped_node_idx]
+            prev_assignment = flipped_node['DISTRICT']
+            next_assignment = partition.assignment[other_node_idx]
+
+            # Recalculate
+            # crossover_count = sum(is_crossover_districts.values())
+            scores = []
+            for part_id in partition.parts.keys():
+                if part_id == prev_assignment:
+                    nodes = [partition.graph.nodes[n] for n in set(partition.parts[prev_assignment]) - {flipped_node_idx}]
+                    min_vote, maj_vote = district_votes(nodes)
+                elif part_id == next_assignment:
+                    nodes = [partition.graph.nodes[n] for n in set(partition.parts[next_assignment]).union({flipped_node_idx})]
+                    min_vote, maj_vote = district_votes(nodes)
+                else:
+                    min_vote, maj_vote = all_district_votes[part_id]
+                scores.append(_score(min_vote, maj_vote))
+            score = np.mean(scores)
+            # prev_district = [partition.graph.nodes[n] for n in set(partition.parts[prev_assignment]) - {flipped_node_idx}]
+            # prev_is_now_crossover = is_crossover_district(prev_district)
+            # next_district = [partition.graph.nodes[n] for n in set(partition.parts[next_assignment]).union({flipped_node_idx})]
+            # next_is_now_crossover = is_crossover_district(next_district)
+            # if is_crossover_districts[prev_assignment] != prev_is_now_crossover:
+            #     crossover_count += 1 if prev_is_now_crossover else -1
+            # if is_crossover_districts[next_assignment] != next_is_now_crossover:
+            #     crossover_count += 1 if next_is_now_crossover else -1
+            # score = crossover_count/n_districts
+
+            flip = {flipped_node_idx: next_assignment}
             p = partition.flip(flip)
-            succs.append((p, score_func(p))) # TODO score_func is very slow
-    succs.sort(key=lambda x: x[1], reverse=True)
-    return [v for (v, _) in succs]
+            succs.append((p, score))
+    # succs.sort(key=lambda x: x[1], reverse=True) # sorted in hill climber
+    return succs
 
 def goal_func(partition):
     p_crossover_districts = sum(1 for d in partition['ej_class_crossover_district'].values() if d)/n_districts
     return p_crossover_districts > 0.9
 
+def _score(min_vote, maj_vote):
+    return min(min_vote/(min_vote+maj_vote), 0.5)
+
 def score_func(partition):
-    p_crossover_districts = sum(1 for d in partition['ej_class_crossover_district'].values() if d)/n_districts
-    return p_crossover_districts
+    all_district_votes = {part_id: district_votes([partition.graph.nodes[n] for n in node_ids]) for part_id, node_ids in partition.parts.items()}
+    # score = sum(_score(min_vote, maj_vote) for min_vote, maj_vote in all_district_votes.values())
+    score = np.mean([_score(min_vote, maj_vote) for min_vote, maj_vote in all_district_votes.values()])
+    return score
 
 def hash_func(partition):
     return hash(frozenset(partition.assignment.items()))
 
+ref = data.load_districts()
+# ref = data.load_service_territories(geom_only=False)
+def summarize(partition, partition_name):
+    print(partition_name)
+    lines = []
+    for id, nodes in initial_partition.parts.items():
+        # name = ref.loc[id]['NAME'] # service territories
+        name = 'District {}'.format(ref.loc[id]['DISTRICT']) # state assembly districts
+        lines.append(name)
+        lines.append('  Tracts: %s' % len(nodes))
+        lines.append('  Population: %s' % initial_partition['population'][id])
+        lines.append('  Mean EJ Class: %s' % initial_partition['mean_ej_class'][id])
+        lines.append('  EJ Class Minority Percent: %s' % initial_partition['ej_class_minority_percent'][id])
+        # lines.append('  EJ Class Crossover District: %s' % initial_partition['ej_class_crossover_district'][id])
+        lines.append('  Mean Wind Class: %s' % initial_partition['mean_wind_class'][id])
+        lines.append('  Mean Solar Class: %s' % initial_partition['mean_solar_class'][id])
+        lines.append('  Power Plants: %s' % initial_partition['power_plants'][id])
+    with open('data/gen/{}_districts_summary.txt'.format(partition_name), 'w') as f:
+        f.write('\n'.join(lines))
+    for line in lines: print(line)
+
+print('Plotting initial partitions...')
+plot_partition(units, initial_partition, 'initial')
+summarize(initial_partition, 'initial')
 
 print('Searching for a districting plan that satisfies criteria...')
 best_partition = hill_climbing(
         initial_partition,
         succ_func,
         goal_func,
+        score_func,
         max_depth=1000,
         hash_func=hash_func)
 
+import ipdb; ipdb.set_trace()
 
 # Plot maps
 print('Generating maps...')
-for f in glob('data/gen/maps/*.png'):
-    os.remove(f)
+plot_partition(units, best_partition, 'best')
+summarize(best_partition, 'best')
 
-initial_partition.plot(units, figsize=(10, 10), cmap='RdYlBu_r')
-plt.axis('off')
-plt.savefig('data/gen/maps/_init.png')
-plt.close()
+import ipdb; ipdb.set_trace()
 
-for i, partition in enumerate([best_partition]):
-    print('% crossover districts:', sum(1 for d in partition['ej_class_crossover_district'].values() if d)/n_districts)
-    print('% majority-minority:', sum(1 for d in partition['ej_class_majority_minority'].values() if d)/n_districts)
-    partition.plot(units, figsize=(10, 10), cmap='RdYlBu_r')
-    plt.axis('off')
-    path = 'data/gen/maps/{}.png'.format(i)
-    plt.savefig(path)
-    plt.close()
+# print('% crossover districts:', sum(1 for d in partition['ej_class_crossover_district'].values() if d)/n_districts)
+# print('% majority-minority:', sum(1 for d in partition['ej_class_majority_minority'].values() if d)/n_districts)

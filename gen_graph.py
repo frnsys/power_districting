@@ -19,6 +19,7 @@ def find_node_by_geoid(geoid):
 
 # Check if any disconnected components (islands), need to connect them manually
 # <https://gerrychain.readthedocs.io/en/latest/user/islands.html#strategy-2-connect-the-components-manually>
+print('Fixing islands (if any)...')
 if graph.islands:
     components = list(connected_components(graph))
     biggest_component_size = max(len(c) for c in components)

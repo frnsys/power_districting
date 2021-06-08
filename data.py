@@ -1,3 +1,4 @@
+import json
 import fiona
 import pandas as pd
 import geopandas as gpd
@@ -18,10 +19,12 @@ service_territories_file = 'data/src/electric_retail_service_territories/Retail_
 holding_companies_file = 'data/src/electric_holding_company_areas/Holding_Company_Areas.shp'
 substations_file = 'data/src/infra/electric_substations/Substations.shp'
 power_plants_file = 'data/src/infra/power_plants/Power_Plants.shp'
+counties_shapefile = 'data/src/counties/tl_2020_us_county.shp'
 
 # Election data
-election_file = 'data/src/2020_US_County_Level_Presidential_Results.csv'
-counties_shapefile = 'data/src/counties/tl_2020_us_county.shp'
+# election_file = 'data/src/2020_US_County_Level_Presidential_Results.csv'
+# primary_election_file = 'data/src/NY_P_6_23_2020_counties.json'
+election_file = 'data/gen/2014_state_primary.csv'
 
 # Existing districts
 districts_file = 'data/src/ny_legislative_boundaries/NYS-Assembly-Districts.shp'
@@ -50,19 +53,20 @@ def load_tracts(geom_only=False):
 
         # Disaggregate county-level election data into tracts
         # Not at all perfect, just an estimate. Best we can do
-        election_df = pd.read_csv(election_file, dtype={'county_fips': str})
-        election_df = election_df[election_df['state_name'] == 'New York']
+        election_df = pd.read_csv(election_file)
+        election_df.rename(columns={election_df.columns[0]: 'NAME'}, inplace=True)
         counties_df = gpd.read_file(counties_shapefile)
-        counties_df['county_fips'] = counties_df['STATEFP'] + counties_df['COUNTYFP']
-        counties = counties_df.merge(election_df, on='county_fips')
-        units = distribute_values(counties, ['votes_gop', 'votes_dem'], units, distribute_type='fractional', distribute_on='population', distribute_round=True)
+        counties_df = counties_df[counties_df['STATEFP'] == '36']
+        counties = counties_df.merge(election_df, on='NAME')
+        units = distribute_values(counties, ['Teachout', 'Cuomo', 'Credico'], units, distribute_type='fractional', distribute_on='population', distribute_round=True)
 
         # Infrastructure
         units['substations'] = _find_matching_features(units, substations_file)
         units['power_plants'] = _find_matching_features(units, power_plants_file)
 
-
     ej_df = pd.read_csv(ej_file, dtype={'Tract_ID': str})
+    ej_df['Wind_Class'] = pd.factorize(ej_df['Wind_Class'], sort=True)[0] # Convert letter classes to integers
+    ej_df['Solar_Class'] = pd.factorize(ej_df['Solar_Class'], sort=True)[0]
     units = units.merge(ej_df, left_on='GEOID', right_on='Tract_ID')
 
     return units
@@ -74,9 +78,13 @@ def available_tract_layers():
 def load_districts():
     return gpd.read_file(districts_file)
 
-def load_service_territories():
+def load_service_territories(geom_only=True):
     df = gpd.read_file(service_territories_file)
-    return df[df['STATE'] == 'NY'][['geometry']]
+    df = df[df['STATE'] == 'NY']
+    if geom_only:
+        return df[['geometry']]
+    else:
+        return df
 
 def load_holding_companies():
     df = gpd.read_file(holding_companies_file)

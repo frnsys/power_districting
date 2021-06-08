@@ -1,7 +1,7 @@
 ## Usage
 
-1. Run `gen_graph.py` to generate the district graph data.
-    - Whenever you want to include different data in the initial graph, update `keep_layers` in that file, and re-run.
+1. Run `gen_graph.py` to generate the tracts graph data.
+    - Whenever you update `data.py#load_tracts`, re-run `gen_graph.py`.
     - This produces `gen/graph.json`
 2. Run `gen_districts.py` to generate districting proposals.
 
@@ -44,6 +44,10 @@
     - updated: 6/24/2020
     - accessed: 2/23/2021
     - source: Homeland Infrastructure Foundation Level Database, Oak Ridge National Laboratory (ORNL), Los Alamos National Laboratory (LANL), Idaho National Laboratory (INL), National Geospatial-Intelligence Agency (NGA) Homeland Security Infrastructure Program (HSIP) Team
+- `data/src/NY_P_6_23_2020_counties.json`
+    - url: <https://apps.npr.org/elections20-primaries/states/NY.html#counties=true&office=P&date=6%2F23%2F2020&party=Dem>
+    - url: <https://www.elections.ny.gov/2014ElectionResults.html>
+    - url: <https://www.elections.ny.gov/NYSBOE/elections/2014/Primary/2014StateLocalPrimaryElectionResults.pdf>
 
 - Election/voting data:
     - <https://www.dailykos.com/stories/2013/07/09/1220127/-Daily-Kos-Elections-2012-election-results-by-congressional-and-legislative-districts>
