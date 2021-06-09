@@ -89,7 +89,7 @@ def gen_plots(bounds, name):
     plot('{} diff (absolute) in EJ Class minority'.format(min_cand), 'ej_class_min_diff', axes[8], cmap, center_cmap=True)
 
     plt.tight_layout()
-    fig.savefig('data/gen/map_analysis__{}.png'.format(name), dpi=300)
+    fig.savefig('analysis/img/map_analysis__{}.png'.format(name), dpi=300)
     # plt.show()
     plt.close()
 
