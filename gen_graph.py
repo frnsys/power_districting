@@ -1,11 +1,40 @@
-import data
+import fiona
+import pandas as pd
+import geopandas as gpd
+from tqdm import tqdm
 from gerrychain import Graph
 from networkx import is_connected, connected_components
-import matplotlib.pyplot as plt
 
-units = data.load_tracts()
-print('Layers:', data.available_tract_layers())
-print('Using layers:', data.keep_layers)
+# Census tracts
+# See `data/src/ACS_2018_5YR_TRACT_36_NEW_YORK.gdb/TRACT_METADATA_2018.txt`
+tracts_file = 'data/src/ACS_2018_5YR_TRACT_36_NEW_YORK.gdb'
+keep_layers = ['X02_RACE']
+geo_layer = 'ACS_2018_5YR_TRACT_36_NEW_YORK'
+ej_file = 'data/src/FPTZ_NY_3/Map_data.csv'
+POP_COL = 'B02001e1' # depends on what layers we load, see the metadata file above
+
+gdb_layers = fiona.listlayers(tracts_file)
+available_tract_layers = [l for l in gdb_layers if l.startswith('X')]
+
+def load_tracts():
+    tracts = gpd.read_file(tracts_file, layer=geo_layer)
+    for layer in tqdm(keep_layers, desc='Merging geodatabase tract layers'):
+        other = gpd.read_file(tracts_file, layer=layer)
+        other['GEOID'] = other['GEOID'].str[7:]
+        tracts = tracts.merge(other.drop('geometry', axis=1), on='GEOID')
+    tracts['population'] = tracts[POP_COL]
+
+    ej_df = pd.read_csv(ej_file, dtype={'Tract_ID': str})
+    ej_df['Wind_Class'] = pd.factorize(ej_df['Wind_Class'], sort=True)[0] # Convert letter classes to integers
+    ej_df['Solar_Class'] = pd.factorize(ej_df['Solar_Class'], sort=True)[0]
+    tracts = tracts.merge(ej_df, left_on='GEOID', right_on='Tract_ID')
+
+    return tracts
+
+units = load_tracts()
+
+print('Layers:', available_tract_layers)
+print('Using layers:', keep_layers)
 print('Tracts:', len(units))
 
 # Load/build the node graph (node=unit)
